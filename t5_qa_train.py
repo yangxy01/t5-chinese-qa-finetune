@@ -1,8 +1,12 @@
 import json
 import os
+import matplotlib
+matplotlib.use("Agg")  # 非交互式后端，无需 GUI
 import matplotlib.pyplot as plt
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
@@ -15,13 +19,16 @@ DEV_DATA_PATH = "data/dev.json"
 OUTPUT_MODEL_DIR = "output/t5_qa_model"
 LOSS_CURVE_PATH = "output/loss_curve.png"
 
-MAX_INPUT_LENGTH = 256   # 降低输入长度，减少内存占用（原512）
+MAX_INPUT_LENGTH = 256
 MAX_TARGET_LENGTH = 64
-BATCH_SIZE = 2           # 降低批大小，避免OOM（原8）
+BATCH_SIZE = 64          # H20 显存充足，大幅提升 batch size 加速训练
 NUM_EPOCHS = 3
 LEARNING_RATE = 3e-4
 WARMUP_RATIO = 0.1
+NUM_WORKERS = 4          # DataLoader 多进程加载数据
+USE_AMP = True           # 启用混合精度训练 (FP16)，显著加速
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUM_GPUS = torch.cuda.device_count()
 
 
 # ===================== 数据集定义 =====================
@@ -96,29 +103,45 @@ def plot_loss_curve(train_losses: list, dev_losses: list, save_path: str):
     plt.grid(True)
     plt.tight_layout()
     plt.savefig(save_path)
-    plt.show()
+    plt.close()
     print(f"收敛曲线已保存至：{save_path}")
 
 
 # ===================== 训练一个 epoch =====================
-def train_one_epoch(model, data_loader, optimizer, scheduler, device):
+def train_one_epoch(model, data_loader, optimizer, scheduler, device, scaler=None):
     model.train()
     total_loss = 0.0
 
     for batch in tqdm(data_loader, desc="Training"):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        labels = batch["labels"].to(device, non_blocking=True)
 
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs.loss
+        optimizer.zero_grad(set_to_none=True)  # 比 zero_grad() 更高效
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if scaler is not None:
+            # 混合精度前向 + 反向
+            with autocast():
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs.loss
+                # DataParallel 多卡时 loss 会是多维的，取均值
+                if loss.dim() > 0:
+                    loss = loss.mean()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss
+            if loss.dim() > 0:
+                loss = loss.mean()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
         scheduler.step()
-
         total_loss += loss.item()
 
     return total_loss / len(data_loader)
@@ -131,19 +154,30 @@ def evaluate_one_epoch(model, data_loader, device):
 
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Evaluating"):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            total_loss += outputs.loss.item()
+            if USE_AMP:
+                with autocast():
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = outputs.loss
+                    if loss.dim() > 0:
+                        loss = loss.mean()
+            else:
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs.loss
+                if loss.dim() > 0:
+                    loss = loss.mean()
+
+            total_loss += loss.item()
 
     return total_loss / len(data_loader)
 
 
 # ===================== 主训练流程 =====================
 def main():
-    print(f"使用设备：{DEVICE}")
+    print(f"使用设备：{DEVICE}，可用 GPU 数量：{NUM_GPUS}")
     os.makedirs(OUTPUT_MODEL_DIR, exist_ok=True)
 
     # 加载 tokenizer 和模型
@@ -152,15 +186,27 @@ def main():
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
     model.to(DEVICE)
 
-    # 构建数据集和 DataLoader
+    # 多 GPU 并行
+    if NUM_GPUS > 1:
+        print(f"启用 DataParallel，使用 {NUM_GPUS} 张 GPU")
+        model = nn.DataParallel(model)
+
+    # 构建数据集和 DataLoader（pin_memory + 多 worker 加速数据加载）
     print("加载训练数据集...")
     train_dataset = QADataset(TRAIN_DATA_PATH, tokenizer, MAX_INPUT_LENGTH, MAX_TARGET_LENGTH)
     dev_dataset = QADataset(DEV_DATA_PATH, tokenizer, MAX_INPUT_LENGTH, MAX_TARGET_LENGTH)
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    dev_loader = DataLoader(dev_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    train_loader = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=NUM_WORKERS, pin_memory=True, drop_last=True
+    )
+    dev_loader = DataLoader(
+        dev_dataset, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=NUM_WORKERS, pin_memory=True
+    )
 
     print(f"训练集样本数：{len(train_dataset)}，验证集样本数：{len(dev_dataset)}")
+    print(f"Batch Size: {BATCH_SIZE}，混合精度(AMP): {USE_AMP}，DataLoader Workers: {NUM_WORKERS}")
 
     # 优化器和学习率调度器
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
@@ -170,13 +216,16 @@ def main():
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
 
+    # 混合精度 scaler
+    scaler = GradScaler() if USE_AMP else None
+
     # 开始训练
     train_losses = []
     dev_losses = []
 
     for epoch in range(1, NUM_EPOCHS + 1):
         print(f"\n========== Epoch {epoch}/{NUM_EPOCHS} ==========")
-        train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, DEVICE)
+        train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, DEVICE, scaler)
         dev_loss = evaluate_one_epoch(model, dev_loader, DEVICE)
 
         train_losses.append(train_loss)
@@ -184,8 +233,9 @@ def main():
 
         print(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Dev Loss: {dev_loss:.4f}")
 
-    # 保存模型和 tokenizer
-    model.save_pretrained(OUTPUT_MODEL_DIR)
+    # 保存模型和 tokenizer（处理 DataParallel 包装）
+    save_model = model.module if isinstance(model, nn.DataParallel) else model
+    save_model.save_pretrained(OUTPUT_MODEL_DIR)
     tokenizer.save_pretrained(OUTPUT_MODEL_DIR)
     print(f"\n模型已保存至：{OUTPUT_MODEL_DIR}")
 
